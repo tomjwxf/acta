@@ -27,5 +27,10 @@ id = "placeholder-create-via-wrangler"
 # binding = "ACTA_ARCHIVE"
 # bucket_name = "acta-archive"
 
+# Workers AI (Tier 2 moderation)
+[ai]
+binding = "AI"
+
 [vars]
 ENVIRONMENT = "development"
+SCOPEBLIND_JWKS_URL = "https://api.scopeblind.com/.well-known/jwks.json"

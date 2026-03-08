@@ -2,10 +2,14 @@
  * Acta — Worker Entry Point
  *
  * Routes API requests to the appropriate handlers.
- * Implements Tier 1 enforcement (schema validation, budget checks).
+ * Implements Tier 1 (schema validation, budget) and Tier 2 (LLM moderation).
  */
 
 import { validateContribution, validateResponse, computeState, TOKEN_COSTS } from './validators/schema.js';
+import { replicateToKV, getEntryFromKV, getTopicForEntry, listTopics, getFeedFromKV } from './kv-index.js';
+import { classifyContent, queueForHumanReview } from './moderation.js';
+import { resolveIdentity } from './identity.js';
+import { renderHTML } from './ui.js';
 
 // Re-export Durable Objects for wrangler
 export { LedgerChain } from './durable-objects/ledger-chain.js';
@@ -16,13 +20,18 @@ export { DeviceBudget } from './durable-objects/device-budget.js';
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, DPoP',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, DPoP, X-Device-Id',
     'Access-Control-Max-Age': '86400',
 };
 
-function corsResponse(body, init = {}) {
+function corsJson(body, init = {}) {
     const headers = { 'Content-Type': 'application/json', ...CORS_HEADERS, ...init.headers };
     return new Response(JSON.stringify(body), { ...init, headers });
+}
+
+function corsHtml(body, init = {}) {
+    const headers = { 'Content-Type': 'text/html; charset=utf-8', ...init.headers };
+    return new Response(body, { ...init, headers });
 }
 
 // ── Main Handler ────────────────────────────────────────────────────
@@ -37,12 +46,26 @@ export default {
         }
 
         try {
-            // ── Read endpoints ──
+            // ── Web UI ──
+            if (request.method === 'GET' && url.pathname === '/') {
+                return corsHtml(renderHTML('home', { topics: await listTopics(env) }));
+            }
+
+            if (request.method === 'GET' && url.pathname.startsWith('/topic/')) {
+                const topic = decodeURIComponent(url.pathname.slice(7));
+                const feed = await getFeedFromKV(env, topic) || { entries: [], total: 0 };
+                return corsHtml(renderHTML('topic', { topic, feed }));
+            }
+
+            if (request.method === 'GET' && url.pathname === '/about') {
+                return corsHtml(renderHTML('about'));
+            }
+
+            // ── API: Read ──
 
             if (request.method === 'GET') {
-                // GET /charter — returns the charter text
-                if (url.pathname === '/charter') {
-                    return corsResponse({
+                if (url.pathname === '/api/charter') {
+                    return corsJson({
                         mission: 'Shared reality for coordination.',
                         charter_url: 'https://github.com/tomjwxf/acta/blob/main/CHARTER.md',
                         invariants: [
@@ -57,42 +80,67 @@ export default {
                     });
                 }
 
-                // GET /feed?topic=...&offset=0&limit=20
-                if (url.pathname === '/feed') {
-                    return handleFeed(url, env);
+                if (url.pathname === '/api/topics') {
+                    return corsJson(await listTopics(env));
                 }
 
-                // GET /entry/:id
-                const entryMatch = url.pathname.match(/^\/entry\/([a-f0-9-]{36})$/);
+                if (url.pathname === '/api/feed') {
+                    const topic = url.searchParams.get('topic');
+                    if (!topic) return corsJson({ error: 'topic_required' }, { status: 400 });
+
+                    const offset = parseInt(url.searchParams.get('offset') || '0');
+                    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
+
+                    // Try KV first (fast), fall back to DO
+                    const kvFeed = await getFeedFromKV(env, topic.trim().toLowerCase(), { offset, limit });
+                    if (kvFeed) return corsJson(kvFeed);
+
+                    // Fallback to DO
+                    const chainDO = getChainDO(env, topic.trim().toLowerCase());
+                    const resp = await chainDO.fetch(new Request(
+                        `http://internal/entries?offset=${offset}&limit=${limit}&order=desc`
+                    ));
+                    return corsJson(await resp.json());
+                }
+
+                const entryMatch = url.pathname.match(/^\/api\/entry\/([a-f0-9-]{36})$/);
                 if (entryMatch) {
-                    return handleGetEntry(entryMatch[1], env);
+                    const meta = await getEntryFromKV(env, entryMatch[1]);
+                    if (meta) return corsJson(meta);
+                    return corsJson({ error: 'not_found' }, { status: 404 });
                 }
 
-                // GET /verify?topic=...
-                if (url.pathname === '/verify') {
-                    return handleVerifyChain(url, env);
+                if (url.pathname === '/api/verify') {
+                    const topic = url.searchParams.get('topic');
+                    if (!topic) return corsJson({ error: 'topic_required' }, { status: 400 });
+                    const chainDO = getChainDO(env, topic.trim().toLowerCase());
+                    const resp = await chainDO.fetch(new Request('http://internal/verify'));
+                    return corsJson(await resp.json());
                 }
             }
 
-            // ── Write endpoints ──
+            // ── API: Write ──
 
             if (request.method === 'POST') {
-                // POST /contribute — submit a typed contribution
-                if (url.pathname === '/contribute') {
-                    return handleContribute(request, env);
+                if (url.pathname === '/api/contribute') {
+                    return handleContribute(request, env, ctx);
                 }
 
-                // POST /respond — submit a typed response
-                if (url.pathname === '/respond') {
-                    return handleRespond(request, env);
+                if (url.pathname === '/api/respond') {
+                    return handleRespond(request, env, ctx);
                 }
             }
 
-            return corsResponse({ error: 'not_found' }, { status: 404 });
+            // 404
+            if (url.pathname.startsWith('/api/')) {
+                return corsJson({ error: 'not_found', endpoints: ['/api/charter', '/api/topics', '/api/feed', '/api/contribute', '/api/respond', '/api/verify'] }, { status: 404 });
+            }
+
+            return corsHtml(renderHTML('404'), { status: 404 });
 
         } catch (err) {
             console.error('[ACTA]', err);
-            return corsResponse({
+            return corsJson({
                 error: 'internal_error',
                 message: env.ENVIRONMENT === 'development' ? err.message : 'An error occurred',
             }, { status: 500 });
@@ -100,55 +148,48 @@ export default {
     },
 };
 
-// ── Handlers ────────────────────────────────────────────────────────
+// ── Write Handlers ──────────────────────────────────────────────────
 
-/**
- * POST /contribute
- * Submit a new typed contribution (question, claim, prediction).
- */
-async function handleContribute(request, env) {
+async function handleContribute(request, env, ctx) {
     const body = await request.json();
-    const { type, topic, payload, device_attestation } = body;
+    const { type, topic, payload } = body;
+
+    // Tier 0: Identity resolution
+    const identity = await resolveIdentity(request, env);
+    if (!identity && env.ENVIRONMENT !== 'development') {
+        return corsJson({ error: 'identity_required', message: 'Device attestation or agent DPoP proof required.' }, { status: 401 });
+    }
+
+    const authorType = identity?.type || 'human';
+    const deviceId = identity?.device_id || 'dev-anonymous';
 
     // Tier 1: Schema validation
     const validation = validateContribution(type, payload || {});
     if (!validation.valid) {
-        return corsResponse({
+        return corsJson({
             error: 'schema_validation_failed',
             action: 'return_for_revision',
             errors: validation.errors,
         }, { status: 422 });
     }
 
-    // Topic is required
     if (!topic || typeof topic !== 'string' || topic.trim().length < 1) {
-        return corsResponse({
+        return corsJson({
             error: 'schema_validation_failed',
             errors: [{ field: 'topic', error: 'Required' }],
         }, { status: 422 });
     }
 
     // Tier 1: Budget check
-    const deviceId = device_attestation || request.headers.get('x-device-id') || 'anonymous';
-    const authorType = body.author_type || 'human';
-    const budgetResult = await checkBudget(env, deviceId, authorType, TOKEN_COSTS[type] || 2);
+    const cost = TOKEN_COSTS[type] || 2;
+    const budgetResult = await checkBudget(env, deviceId, authorType, cost);
     if (!budgetResult.allowed) {
-        return corsResponse({
+        return corsJson({
             error: 'budget_exceeded',
             tokens_remaining: budgetResult.tokens_remaining,
             tokens_requested: budgetResult.tokens_requested,
             resets_at: budgetResult.resets_at,
         }, { status: 429 });
-    }
-
-    // Determine initial state
-    let initialState = 'open';
-    if (type === 'claim' && payload.category === 'factual' && !payload.source && payload.reasoning) {
-        // Has reasoning but no hard source — still open
-        initialState = 'open';
-    } else if (type === 'claim' && payload.category === 'factual' && !payload.source && !payload.reasoning) {
-        // This shouldn't happen (schema validator catches it), but defensive
-        initialState = 'unsubstantiated';
     }
 
     // Build the ledger entry
@@ -159,41 +200,77 @@ async function handleContribute(request, env) {
         author: {
             type: authorType,
             device_attestation_hash: await hashString(deviceId),
+            method: identity?.method || 'none',
+            trust_level: identity?.trust_level || 'none',
             agent_operator: body.agent_operator || null,
         },
         payload,
-        state: initialState,
+        state: 'open',
         linked_to: [],
     };
+
+    // Tier 2: Content classification (async — doesn't block write for accepted content)
+    const classification = await classifyContent(env, entry);
+
+    if (classification.action === 'hard_reject_flag') {
+        // Hold the entry — don't write to ledger. Queue for Tier 3.
+        if (ctx?.waitUntil) {
+            ctx.waitUntil(queueForHumanReview(env, entry, classification));
+        }
+        return corsJson({
+            status: 'held_for_review',
+            reason: 'Content flagged for human review. It will be published or rejected after review.',
+        }, { status: 202 });
+    }
+
+    // Apply tags from classification
+    if (classification.tags?.length > 0) {
+        entry.moderation_tags = classification.tags;
+    }
 
     // Append to ledger chain
     const chainResult = await appendToChain(env, entry.topic, entry);
 
-    // Async: replicate to KV for feed queries
-    // (In production, this would also replicate to R2 for archival)
+    // Async: replicate to KV
+    if (ctx?.waitUntil) {
+        ctx.waitUntil(replicateToKV(env, ctx, entry, chainResult));
+    } else {
+        await replicateToKV(env, null, entry, chainResult);
+    }
 
-    return corsResponse({
+    return corsJson({
         status: 'accepted',
         entry_id: chainResult.entry_id,
         entry_hash: chainResult.entry_hash,
         sequence: chainResult.sequence,
-        state: initialState,
+        state: entry.state,
+        moderation_tags: entry.moderation_tags || [],
         tokens_remaining: budgetResult.tokens_remaining,
+        identity: {
+            type: authorType,
+            method: identity?.method || 'none',
+            trust_level: identity?.trust_level || 'none',
+        },
     }, { status: 201 });
 }
 
-/**
- * POST /respond
- * Submit a typed response (evidence, challenge, update, resolution).
- */
-async function handleRespond(request, env) {
+async function handleRespond(request, env, ctx) {
     const body = await request.json();
-    const { type, topic, payload, device_attestation } = body;
+    const { type, topic, payload } = body;
+
+    // Tier 0: Identity
+    const identity = await resolveIdentity(request, env);
+    if (!identity && env.ENVIRONMENT !== 'development') {
+        return corsJson({ error: 'identity_required' }, { status: 401 });
+    }
+
+    const authorType = identity?.type || 'human';
+    const deviceId = identity?.device_id || 'dev-anonymous';
 
     // Tier 1: Schema validation
     const validation = validateResponse(type, payload || {});
     if (!validation.valid) {
-        return corsResponse({
+        return corsJson({
             error: 'schema_validation_failed',
             action: 'return_for_revision',
             errors: validation.errors,
@@ -201,26 +278,23 @@ async function handleRespond(request, env) {
     }
 
     if (!topic || typeof topic !== 'string') {
-        return corsResponse({
+        return corsJson({
             error: 'schema_validation_failed',
             errors: [{ field: 'topic', error: 'Required' }],
         }, { status: 422 });
     }
 
-    // Tier 1: Budget check
-    const deviceId = device_attestation || request.headers.get('x-device-id') || 'anonymous';
-    const authorType = body.author_type || 'human';
-    const budgetResult = await checkBudget(env, deviceId, authorType, TOKEN_COSTS[type] || 1);
+    // Tier 1: Budget
+    const cost = TOKEN_COSTS[type] || 1;
+    const budgetResult = await checkBudget(env, deviceId, authorType, cost);
     if (!budgetResult.allowed) {
-        return corsResponse({
+        return corsJson({
             error: 'budget_exceeded',
             tokens_remaining: budgetResult.tokens_remaining,
-            tokens_requested: budgetResult.tokens_requested,
             resets_at: budgetResult.resets_at,
         }, { status: 429 });
     }
 
-    // Build the ledger entry
     const entry = {
         type: 'response',
         subtype: type,
@@ -228,140 +302,70 @@ async function handleRespond(request, env) {
         author: {
             type: authorType,
             device_attestation_hash: await hashString(deviceId),
+            method: identity?.method || 'none',
+            trust_level: identity?.trust_level || 'none',
             agent_operator: body.agent_operator || null,
         },
         payload,
-        state: null, // Responses don't have independent state
+        state: null,
         linked_to: [payload.target_id],
     };
 
-    // Append to ledger chain
+    // Tier 2: classify
+    const classification = await classifyContent(env, entry);
+    if (classification.action === 'hard_reject_flag') {
+        if (ctx?.waitUntil) ctx.waitUntil(queueForHumanReview(env, entry, classification));
+        return corsJson({ status: 'held_for_review' }, { status: 202 });
+    }
+    if (classification.tags?.length > 0) entry.moderation_tags = classification.tags;
+
     const chainResult = await appendToChain(env, entry.topic, entry);
 
-    return corsResponse({
+    if (ctx?.waitUntil) {
+        ctx.waitUntil(replicateToKV(env, ctx, entry, chainResult));
+    } else {
+        await replicateToKV(env, null, entry, chainResult);
+    }
+
+    return corsJson({
         status: 'accepted',
         entry_id: chainResult.entry_id,
         entry_hash: chainResult.entry_hash,
         sequence: chainResult.sequence,
+        moderation_tags: entry.moderation_tags || [],
         tokens_remaining: budgetResult.tokens_remaining,
     }, { status: 201 });
 }
 
-/**
- * GET /feed?topic=...&offset=0&limit=20
- * Read contributions and responses for a topic.
- */
-async function handleFeed(url, env) {
-    const topic = url.searchParams.get('topic');
-    if (!topic) {
-        return corsResponse({ error: 'topic_required' }, { status: 400 });
-    }
-
-    const offset = parseInt(url.searchParams.get('offset') || '0');
-    const limit = parseInt(url.searchParams.get('limit') || '20');
-
-    const chainDO = getChainDO(env, topic.trim().toLowerCase());
-    const resp = await chainDO.fetch(new Request('http://internal/entries?' +
-        `offset=${offset}&limit=${limit}&order=${url.searchParams.get('order') || 'desc'}`
-    ));
-
-    const data = await resp.json();
-
-    // Compute states for contributions
-    const contributions = data.entries.filter(e => e.type === 'contribution');
-    const responses = data.entries.filter(e => e.type === 'response');
-
-    for (const c of contributions) {
-        const related = responses.filter(r => r.linked_to?.includes(c.entry_id));
-        const computed = computeState(c, related);
-        c.computed_state = computed.state;
-        c.display_hint = computed.display_hint;
-    }
-
-    return corsResponse(data);
-}
-
-/**
- * GET /entry/:id
- * Get a single entry with its responses and computed state.
- */
-async function handleGetEntry(entryId, env) {
-    // For v1, we'd need to know the topic to find the entry.
-    // This requires a KV index: entry_id → topic mapping.
-    // For now, return a note about this limitation.
-    return corsResponse({
-        error: 'not_implemented',
-        message: 'Single-entry lookup requires KV index (entry_id → topic). Coming in next iteration.',
-    }, { status: 501 });
-}
-
-/**
- * GET /verify?topic=...
- * Verify the hash chain for a topic is intact.
- */
-async function handleVerifyChain(url, env) {
-    const topic = url.searchParams.get('topic');
-    if (!topic) {
-        return corsResponse({ error: 'topic_required' }, { status: 400 });
-    }
-
-    const chainDO = getChainDO(env, topic.trim().toLowerCase());
-    const resp = await chainDO.fetch(new Request('http://internal/verify'));
-    const data = await resp.json();
-
-    return corsResponse(data);
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/**
- * Get or create the LedgerChain DO for a topic.
- */
 function getChainDO(env, topic) {
     const id = env.LEDGER_CHAIN.idFromName(topic);
     return env.LEDGER_CHAIN.get(id);
 }
 
-/**
- * Check and spend device budget.
- */
 async function checkBudget(env, deviceId, authorType, cost) {
     const id = env.DEVICE_BUDGET.idFromName(deviceId);
     const stub = env.DEVICE_BUDGET.get(id);
-
     const resp = await stub.fetch(new Request('http://internal/spend', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ cost, author_type: authorType }),
     }));
-
     return resp.json();
 }
 
-/**
- * Append an entry to the topic's ledger chain.
- */
 async function appendToChain(env, topic, entry) {
     const chainDO = getChainDO(env, topic);
-
     const resp = await chainDO.fetch(new Request('http://internal/append', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(entry),
     }));
-
     return resp.json();
 }
 
-/**
- * SHA-256 hash a string, return hex.
- */
 async function hashString(str) {
-    const buffer = await crypto.subtle.digest(
-        'SHA-256',
-        new TextEncoder().encode(str)
-    );
-    return [...new Uint8Array(buffer)]
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
+    const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return [...new Uint8Array(buffer)].map(b => b.toString(16).padStart(2, '0')).join('');
 }

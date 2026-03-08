@@ -1,0 +1,31 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "acta"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# Durable Objects
+[[durable_objects.bindings]]
+name = "LEDGER_CHAIN"
+class_name = "LedgerChain"
+
+[[durable_objects.bindings]]
+name = "DEVICE_BUDGET"
+class_name = "DeviceBudget"
+
+# Migrations for Durable Objects
+[[migrations]]
+tag = "v1"
+new_classes = ["LedgerChain", "DeviceBudget"]
+
+# KV Namespaces
+[[kv_namespaces]]
+binding = "ACTA_KV"
+id = "placeholder-create-via-wrangler"
+
+# R2 Bucket (archival)
+# [[r2_buckets]]
+# binding = "ACTA_ARCHIVE"
+# bucket_name = "acta-archive"
+
+[vars]
+ENVIRONMENT = "development"

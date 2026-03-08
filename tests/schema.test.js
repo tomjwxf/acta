@@ -242,7 +242,7 @@ describe('computeState', () => {
     it('returns open with supported hint when evidence exists and no challenges', () => {
         const claim = { entry_id: 'c1', subtype: 'claim', state: 'open' };
         const responses = [
-            { entry_id: 'e1', subtype: 'evidence', target_id: 'c1', stance: 'supporting' },
+            { entry_id: 'e1', subtype: 'evidence', target_id: 'c1', payload: { stance: 'supporting' } },
         ];
         const result = computeState(claim, responses);
         expect(result.state).toBe('open');

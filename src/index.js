@@ -193,7 +193,15 @@ async function handleContribute(request, env, ctx) {
         }, { status: 409 });
     }
 
-    // Tier 1: Budget check
+    // Tier 2: Content classification (before budget — don't charge for held content)
+    const classification = await classifyContent(env, entry);
+    if (classification.action === 'hard_reject_flag') {
+        if (ctx?.waitUntil) ctx.waitUntil(queueForHumanReview(env, entry, classification));
+        return corsJson({ status: 'held_for_review', reason: 'Content flagged for human review.' }, { status: 202 });
+    }
+    if (classification.tags?.length > 0) entry.moderation_tags = classification.tags;
+
+    // Tier 1: Budget check (after moderation — only charge for accepted content)
     const cost = TOKEN_COSTS[type] || 2;
     const budgetResult = await checkBudget(env, deviceId, authorType, cost);
     if (!budgetResult.allowed) {
@@ -203,14 +211,6 @@ async function handleContribute(request, env, ctx) {
             resets_at: budgetResult.resets_at,
         }, { status: 429 });
     }
-
-    // Tier 2: Content classification
-    const classification = await classifyContent(env, entry);
-    if (classification.action === 'hard_reject_flag') {
-        if (ctx?.waitUntil) ctx.waitUntil(queueForHumanReview(env, entry, classification));
-        return corsJson({ status: 'held_for_review', reason: 'Content flagged for human review.' }, { status: 202 });
-    }
-    if (classification.tags?.length > 0) entry.moderation_tags = classification.tags;
 
     // Append to ledger chain
     const chainResult = await appendToChain(env, entry.topic, entry);
@@ -256,13 +256,6 @@ async function handleRespond(request, env, ctx) {
         return corsJson({ error: 'schema_validation_failed', errors: [{ field: 'topic', error: 'Required' }] }, { status: 422 });
     }
 
-    // Tier 1: Budget
-    const cost = TOKEN_COSTS[type] || 1;
-    const budgetResult = await checkBudget(env, deviceId, authorType, cost);
-    if (!budgetResult.allowed) {
-        return corsJson({ error: 'budget_exceeded', tokens_remaining: budgetResult.tokens_remaining, resets_at: budgetResult.resets_at }, { status: 429 });
-    }
-
     const entry = {
         type: 'response',
         subtype: type,
@@ -279,13 +272,20 @@ async function handleRespond(request, env, ctx) {
         linked_to: [payload.target_id],
     };
 
-    // Tier 2: classify
+    // Tier 2: classify (before budget — don't charge for held content)
     const classification = await classifyContent(env, entry);
     if (classification.action === 'hard_reject_flag') {
         if (ctx?.waitUntil) ctx.waitUntil(queueForHumanReview(env, entry, classification));
         return corsJson({ status: 'held_for_review' }, { status: 202 });
     }
     if (classification.tags?.length > 0) entry.moderation_tags = classification.tags;
+
+    // Tier 1: Budget (after moderation — only charge for accepted content)
+    const cost = TOKEN_COSTS[type] || 1;
+    const budgetResult = await checkBudget(env, deviceId, authorType, cost);
+    if (!budgetResult.allowed) {
+        return corsJson({ error: 'budget_exceeded', tokens_remaining: budgetResult.tokens_remaining, resets_at: budgetResult.resets_at }, { status: 429 });
+    }
 
     const chainResult = await appendToChain(env, entry.topic, entry);
 

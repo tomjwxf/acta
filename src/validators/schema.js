@@ -314,7 +314,7 @@ function computeClaimState(claim, responses) {
     // Check if claim started as unsubstantiated and now has evidence
     if (claim.state === 'unsubstantiated') {
         const supportingEvidence = responses.filter(
-            r => r.subtype === 'evidence' && r.stance === 'supporting'
+            r => r.subtype === 'evidence' && r.payload?.stance === 'supporting'
         );
         if (supportingEvidence.length === 0) {
             return { state: 'unsubstantiated', display_hint: null };
@@ -323,7 +323,7 @@ function computeClaimState(claim, responses) {
 
     // Compute display hint
     const supportingEvidence = responses.filter(
-        r => r.subtype === 'evidence' && r.stance === 'supporting'
+        r => r.subtype === 'evidence' && r.payload?.stance === 'supporting'
     );
     const displayHint = supportingEvidence.length > 0 && challenges.length === 0
         ? 'supported'

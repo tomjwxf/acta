@@ -202,9 +202,10 @@ export class LedgerChain {
 
   /**
    * Compute SHA-256 hash of an object using deterministic serialization.
+   * Recursively sorts ALL keys (not just top-level) to ensure consistent hashing.
    */
   async computeHash(obj) {
-    const canonical = JSON.stringify(obj, Object.keys(obj).sort());
+    const canonical = JSON.stringify(this.sortKeysDeep(obj));
     const buffer = await crypto.subtle.digest(
       'SHA-256',
       new TextEncoder().encode(canonical)
@@ -212,6 +213,18 @@ export class LedgerChain {
     return [...new Uint8Array(buffer)]
       .map((b) => b.toString(16).padStart(2, '0'))
       .join('');
+  }
+
+  /**
+   * Recursively sort all object keys for deterministic serialization.
+   */
+  sortKeysDeep(obj) {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return obj.map(item => this.sortKeysDeep(item));
+    return Object.keys(obj).sort().reduce((acc, key) => {
+      acc[key] = this.sortKeysDeep(obj[key]);
+      return acc;
+    }, {});
   }
 
   /**

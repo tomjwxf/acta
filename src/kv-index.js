@@ -40,6 +40,7 @@ export async function replicateToKV(env, ctx, entry, chainResult) {
             body_preview: truncate(entry.payload?.body, 200),
             category: entry.payload?.category || null,
             tags: entry.payload?.tags || [],
+            moderation_tags: entry.moderation_tags || [],
         };
 
         // 1. Entry index — fast lookup by entry_id

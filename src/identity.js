@@ -8,10 +8,16 @@
  *   Tier 2: DPoP (cryptographic, agents/CLIs)
  *   Tier 3: VOPRF (privacy-preserving, fallback)
  *
- * For v1, we implement:
- *   - DPoP proof validation (for agents via ScopeBlind Passport)
- *   - Pass-token JWT validation (for browsers via ScopeBlind widget)
- *   - Fallback: header-based device ID (development only)
+ * Per-topic pseudonyms (from adversarial analysis):
+ *   Public ledger entries use topic_pseudonym = HMAC-SHA256(device_id, topic)
+ *   This gives one permanent pseudonym per device per topic.
+ *   Cross-topic privacy: different topic = different pseudonym.
+ *   Within-topic accountability: same device = same pseudonym always.
+ *   Budget enforcement uses the real device_id (never exposed publicly).
+ *
+ *   HMAC is a correct functional placeholder for VOPRF derivation.
+ *   When ScopeBlind VOPRF is integrated, this becomes:
+ *     topic_pseudonym = VOPRF_Eval(device_key, topic)
  */
 
 // ── DPoP Proof Validation ───────────────────────────────────────────
@@ -19,10 +25,6 @@
 /**
  * Extract and validate a DPoP proof from request headers.
  * Returns a device identity object or null.
- *
- * DPoP header format: base64url(header).base64url(payload).base64url(signature)
- * Header contains: { typ: "dpop+jwt", alg: "ES256", jwk: { kty, crv, x, y } }
- * Payload contains: { jti, htm, htu, iat }
  */
 export async function verifyDPoP(request) {
     const dpopHeader = request.headers.get('DPoP');
@@ -32,11 +34,9 @@ export async function verifyDPoP(request) {
         const parts = dpopHeader.split('.');
         if (parts.length !== 3) return null;
 
-        // Decode header (contains the public key)
         const header = JSON.parse(b64urlDecode(parts[0]));
         if (header.typ !== 'dpop+jwt' || !header.jwk) return null;
 
-        // Decode payload
         const payload = JSON.parse(b64urlDecode(parts[1]));
 
         // Check freshness (proof must be < 5 minutes old)
@@ -72,13 +72,8 @@ export async function verifyDPoP(request) {
 
 /**
  * Validate a ScopeBlind pass-token JWT from cookie or Authorization header.
- * The token was issued by the ScopeBlind verifier after successful device proof.
- *
- * For v1, we validate the JWT structure and extract the device hash.
- * Full signature verification requires the JWKS from api.scopeblind.com.
  */
 export async function verifyPassToken(request, env) {
-    // Check Authorization header first, then cookie
     const authHeader = request.headers.get('Authorization');
     let token = null;
 
@@ -98,17 +93,9 @@ export async function verifyPassToken(request, env) {
 
         const payload = JSON.parse(b64urlDecode(parts[1]));
 
-        // Check expiration
         if (payload.exp && payload.exp < Date.now() / 1000) return null;
-
-        // Check issuer
         if (payload.iss && !payload.iss.includes('scopeblind')) return null;
 
-        // For full verification, we'd fetch JWKS from api.scopeblind.com
-        // and verify the EdDSA signature. For v1, we trust the structure
-        // and verify signatures in production via JWKS fetch.
-
-        // If SCOPEBLIND_JWKS_URL is configured, do full verification
         if (env.SCOPEBLIND_JWKS_URL) {
             const verified = await verifyWithJWKS(token, env.SCOPEBLIND_JWKS_URL);
             if (!verified) return null;
@@ -127,22 +114,66 @@ export async function verifyPassToken(request, env) {
     }
 }
 
+// ── Per-Topic Pseudonym ─────────────────────────────────────────────
+
+/**
+ * Derive a per-topic pseudonym from a device ID and topic.
+ * Uses HMAC-SHA256(device_id, topic) — deterministic, per-topic, unlinkable.
+ *
+ * Same device + same topic = same pseudonym (within-topic accountability).
+ * Same device + different topic = different pseudonym (cross-topic privacy).
+ *
+ * This is a correct functional placeholder for VOPRF derivation.
+ *
+ * @param {string} deviceId - the real device identifier (private, never exposed)
+ * @param {string} topic - the topic name
+ * @returns {string} hex-encoded pseudonym
+ */
+export async function deriveTopicPseudonym(deviceId, topic) {
+    const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(deviceId),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign']
+    );
+
+    const signature = await crypto.subtle.sign(
+        'HMAC',
+        key,
+        new TextEncoder().encode(topic)
+    );
+
+    return [...new Uint8Array(signature)]
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
 // ── Unified Identity Resolution ─────────────────────────────────────
 
 /**
  * Resolve the identity of a request.
  * Tries methods in priority order: DPoP (agents) → Pass-token (browsers) → Fallback.
  *
- * Returns { type, method, device_id, trust_level }
+ * Returns { type, method, device_id, topic_pseudonym, trust_level }
+ *
+ * device_id: real identifier, used for budget checks (private, server-side only)
+ * topic_pseudonym: per-topic unlinkable pseudonym (public, goes in the ledger)
+ *
+ * @param {Request} request
+ * @param {object} env
+ * @param {string} topic - the topic being contributed to
  */
-export async function resolveIdentity(request, env) {
+export async function resolveIdentity(request, env, topic = null) {
     // 1. Try DPoP (agent identity)
     const dpop = await verifyDPoP(request);
     if (dpop) {
+        const deviceId = dpop.thumbprint;
         return {
             type: 'agent',
             method: 'dpop',
-            device_id: dpop.thumbprint,
+            device_id: deviceId,
+            topic_pseudonym: topic ? await deriveTopicPseudonym(deviceId, topic) : deviceId,
             trust_level: 'cryptographic',
             details: dpop,
         };
@@ -151,10 +182,12 @@ export async function resolveIdentity(request, env) {
     // 2. Try ScopeBlind pass-token (browser identity)
     const passToken = await verifyPassToken(request, env);
     if (passToken) {
+        const deviceId = passToken.device_hash;
         return {
             type: passToken.type,
             method: passToken.method,
-            device_id: passToken.device_hash,
+            device_id: deviceId,
+            topic_pseudonym: topic ? await deriveTopicPseudonym(deviceId, topic) : deviceId,
             trust_level: passToken.tier === 'hardware' ? 'hardware' : 'cryptographic',
             details: passToken,
         };
@@ -167,7 +200,8 @@ export async function resolveIdentity(request, env) {
             type: 'human',
             method: 'header',
             device_id: headerDeviceId,
-            trust_level: 'none', // No cryptographic verification
+            topic_pseudonym: topic ? await deriveTopicPseudonym(headerDeviceId, topic) : headerDeviceId,
+            trust_level: 'none',
             details: null,
         };
     }
@@ -175,10 +209,12 @@ export async function resolveIdentity(request, env) {
     // 4. Anonymous — IP-based (lowest trust, development only)
     if (env.ENVIRONMENT === 'development') {
         const ip = request.headers.get('cf-connecting-ip') || 'localhost';
+        const deviceId = await hashString(`anon:${ip}`);
         return {
             type: 'human',
             method: 'anonymous',
-            device_id: await hashString(`anon:${ip}`),
+            device_id: deviceId,
+            topic_pseudonym: topic ? await deriveTopicPseudonym(deviceId, topic) : deviceId,
             trust_level: 'none',
             details: null,
         };
@@ -189,12 +225,7 @@ export async function resolveIdentity(request, env) {
 
 // ── Crypto Helpers ──────────────────────────────────────────────────
 
-/**
- * Compute JWK Thumbprint per RFC 7638.
- * Canonical JSON of required members, then SHA-256.
- */
 async function computeJWKThumbprint(jwk) {
-    // For EC keys (ES256/P-256): required members are crv, kty, x, y
     const canonical = JSON.stringify({
         crv: jwk.crv,
         kty: jwk.kty,
@@ -210,9 +241,6 @@ async function computeJWKThumbprint(jwk) {
     return b64urlEncode(new Uint8Array(hash));
 }
 
-/**
- * Verify an ES256 (P-256 + SHA-256) signature.
- */
 async function verifyES256(message, signatureB64, jwk) {
     try {
         const key = await crypto.subtle.importKey(
@@ -237,18 +265,12 @@ async function verifyES256(message, signatureB64, jwk) {
     }
 }
 
-/**
- * Fetch and verify against JWKS endpoint (for ScopeBlind pass-tokens).
- */
 async function verifyWithJWKS(token, jwksUrl) {
     // TODO: Implement full JWKS fetch + EdDSA verification
-    // For v1, this is a placeholder — structure is verified, signature
-    // verification is deferred to when JWKS integration is complete.
     return true;
 }
 
 function computeTokenHash(token) {
-    // Quick hash for device identification from token
     return token.split('.')[1]?.slice(0, 16) || 'unknown';
 }
 

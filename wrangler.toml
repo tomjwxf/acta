@@ -31,6 +31,10 @@ id = "placeholder-create-via-wrangler"
 [ai]
 binding = "AI"
 
+# Cron triggers for chain head anchoring
+[triggers]
+crons = ["0 0 * * *"]  # Daily at midnight UTC
+
 [vars]
 ENVIRONMENT = "development"
 SCOPEBLIND_JWKS_URL = "https://api.scopeblind.com/.well-known/jwks.json"

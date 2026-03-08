@@ -2,19 +2,32 @@
  * Acta — Worker Entry Point
  *
  * Routes API requests to the appropriate handlers.
- * Full pipeline: Identity → Schema → Duplicate → Budget → Moderation → Ledger → KV
+ * Full pipeline: Identity → Schema → Response Matrix → Duplicate → Moderation → Budget → Ledger → KV
+ *
+ * Key architectural decisions (from adversarial analysis):
+ *   - device_id is private (for budget checks only)
+ *   - topic_pseudonym is public (goes in the ledger, unlinkable across topics)
+ *   - Moderation runs before budget (don't charge for held/rejected content)
+ *   - Tier 1A rejects get public receipts; Tier 1B silently dropped with public counter
+ *   - Response target matrix enforced (claims never resolve)
+ *   - Shot clock with configurable decay for challenge state
  */
 
-import { validateContribution, validateResponse, computeState, TOKEN_COSTS } from './validators/schema.js';
+import { validateContribution, validateResponse, validateResponseTarget, computeState, TOKEN_COSTS } from './validators/schema.js';
 import { replicateToKV, getEntryFromKV, getTopicForEntry, listTopics, getFeedFromKV } from './kv-index.js';
-import { classifyContent, queueForHumanReview } from './moderation.js';
+import { classifyContent, createRejectionReceipt, logSilentDrop, queueForHumanReview } from './moderation.js';
 import { resolveIdentity } from './identity.js';
 import { checkDuplicate, recordSubmission } from './duplicate-detection.js';
+import { handleScheduled } from './chain-publication.js';
 import { renderHTML } from './ui.js';
 
 // Re-export Durable Objects for wrangler
 export { LedgerChain } from './durable-objects/ledger-chain.js';
 export { DeviceBudget } from './durable-objects/device-budget.js';
+
+// ── Policy Constants ────────────────────────────────────────────────
+
+const CHALLENGE_DECAY_HOURS = 168; // 7 days default shot clock
 
 // ── CORS ────────────────────────────────────────────────────────────
 
@@ -93,7 +106,7 @@ export default {
                     return corsJson(await getTopicFeedWithState(env, topic.trim().toLowerCase()));
                 }
 
-                // Single entry lookup (now implemented via KV)
+                // Single entry lookup
                 const entryMatch = url.pathname.match(/^\/api\/entry\/([a-f0-9-]{36})$/);
                 if (entryMatch) {
                     return handleGetEntry(env, entryMatch[1]);
@@ -105,6 +118,18 @@ export default {
                     const chainDO = getChainDO(env, topic.trim().toLowerCase());
                     const resp = await chainDO.fetch(new Request('http://internal/verify'));
                     return corsJson(await resp.json());
+                }
+
+                // Chain heads for external anchoring
+                if (url.pathname === '/api/chain-heads') {
+                    return corsJson(await getChainHeads(env));
+                }
+
+                // Data export (full topic dump for independent verification)
+                const exportMatch = url.pathname.match(/^\/api\/export\/(.+)$/);
+                if (exportMatch) {
+                    const topic = decodeURIComponent(exportMatch[1]).trim().toLowerCase();
+                    return handleExport(env, topic);
                 }
 
                 // Moderation log API
@@ -138,6 +163,11 @@ export default {
             }, { status: 500 });
         }
     },
+
+    // Cron trigger: daily Merkle root anchoring of all chain heads
+    async scheduled(event, env, ctx) {
+        ctx.waitUntil(handleScheduled(env));
+    },
 };
 
 // ── Write Handlers ──────────────────────────────────────────────────
@@ -146,14 +176,21 @@ async function handleContribute(request, env, ctx) {
     const body = await request.json();
     const { type, topic, payload } = body;
 
-    // Tier 0: Identity
-    const identity = await resolveIdentity(request, env);
+    if (!topic || typeof topic !== 'string' || topic.trim().length < 1) {
+        return corsJson({ error: 'schema_validation_failed', errors: [{ field: 'topic', error: 'Required' }] }, { status: 422 });
+    }
+
+    const normalizedTopic = topic.trim().toLowerCase();
+
+    // Tier 0: Identity (pass topic for per-topic pseudonym derivation)
+    const identity = await resolveIdentity(request, env, normalizedTopic);
     if (!identity && env.ENVIRONMENT !== 'development') {
         return corsJson({ error: 'identity_required' }, { status: 401 });
     }
 
     const authorType = identity?.type || 'human';
     const deviceId = identity?.device_id || 'dev-anonymous';
+    const topicPseudonym = identity?.topic_pseudonym || 'anon';
 
     // Tier 1: Schema validation
     const validation = validateContribution(type, payload || {});
@@ -161,28 +198,25 @@ async function handleContribute(request, env, ctx) {
         return corsJson({ error: 'schema_validation_failed', action: 'return_for_revision', errors: validation.errors }, { status: 422 });
     }
 
-    if (!topic || typeof topic !== 'string' || topic.trim().length < 1) {
-        return corsJson({ error: 'schema_validation_failed', errors: [{ field: 'topic', error: 'Required' }] }, { status: 422 });
-    }
-
-    // Build entry early for duplicate check
+    // Build entry with per-topic pseudonym (public) — device_id never exposed
     const entry = {
         type: 'contribution',
         subtype: type,
-        topic: topic.trim().toLowerCase(),
+        topic: normalizedTopic,
         author: {
             type: authorType,
-            device_attestation_hash: await hashString(deviceId),
+            topic_pseudonym: topicPseudonym,   // PUBLIC: per-topic, unlinkable
             method: identity?.method || 'none',
             trust_level: identity?.trust_level || 'none',
             agent_operator: body.agent_operator || null,
+            // Note: device_id is NOT stored in the entry. Budget checks use it server-side only.
         },
         payload,
         state: 'open',
         linked_to: [],
     };
 
-    // Tier 1: Duplicate detection
+    // Tier 1: Duplicate detection (uses device_id via author hash internally)
     const dupCheck = await checkDuplicate(env, entry);
     if (dupCheck.duplicate) {
         return corsJson({
@@ -195,10 +229,28 @@ async function handleContribute(request, env, ctx) {
 
     // Tier 2: Content classification (before budget — don't charge for held content)
     const classification = await classifyContent(env, entry);
-    if (classification.action === 'hard_reject_flag') {
-        if (ctx?.waitUntil) ctx.waitUntil(queueForHumanReview(env, entry, classification));
-        return corsJson({ status: 'held_for_review', reason: 'Content flagged for human review.' }, { status: 202 });
+
+    // Tier 1B: Silent drop (CSAM, malware, credible violence)
+    if (classification.action === 'tier_1b_reject') {
+        if (ctx?.waitUntil) ctx.waitUntil(logSilentDrop(env, classification));
+        return corsJson({ error: 'submission_rejected' }, { status: 403 });
     }
+
+    // Tier 1A: Public rejection receipt (doxxing, impersonation)
+    if (classification.action === 'tier_1a_reject') {
+        const receiptWork = async () => {
+            await createRejectionReceipt(env, entry, classification);
+            await queueForHumanReview(env, entry, classification);
+        };
+        if (ctx?.waitUntil) ctx.waitUntil(receiptWork());
+        return corsJson({
+            status: 'rejected',
+            reason: 'Content flagged for review. A public rejection receipt has been created.',
+            content_hash: classification.content_hash,
+            appeal_state: 'open',
+        }, { status: 422 });
+    }
+
     if (classification.tags?.length > 0) entry.moderation_tags = classification.tags;
 
     // Tier 1: Budget check (after moderation — only charge for accepted content)
@@ -213,7 +265,7 @@ async function handleContribute(request, env, ctx) {
     }
 
     // Append to ledger chain
-    const chainResult = await appendToChain(env, entry.topic, entry);
+    const chainResult = await appendToChain(env, normalizedTopic, entry);
 
     // Async: KV replication + duplicate recording
     const asyncWork = async () => {
@@ -226,6 +278,7 @@ async function handleContribute(request, env, ctx) {
         status: 'accepted',
         entry_id: chainResult.entry_id,
         entry_hash: chainResult.entry_hash,
+        payload_hash: chainResult.payload_hash,
         sequence: chainResult.sequence,
         state: entry.state,
         moderation_tags: entry.moderation_tags || [],
@@ -237,14 +290,21 @@ async function handleRespond(request, env, ctx) {
     const body = await request.json();
     const { type, topic, payload } = body;
 
+    if (!topic || typeof topic !== 'string') {
+        return corsJson({ error: 'schema_validation_failed', errors: [{ field: 'topic', error: 'Required' }] }, { status: 422 });
+    }
+
+    const normalizedTopic = topic.trim().toLowerCase();
+
     // Tier 0: Identity
-    const identity = await resolveIdentity(request, env);
+    const identity = await resolveIdentity(request, env, normalizedTopic);
     if (!identity && env.ENVIRONMENT !== 'development') {
         return corsJson({ error: 'identity_required' }, { status: 401 });
     }
 
     const authorType = identity?.type || 'human';
     const deviceId = identity?.device_id || 'dev-anonymous';
+    const topicPseudonym = identity?.topic_pseudonym || 'anon';
 
     // Tier 1: Schema
     const validation = validateResponse(type, payload || {});
@@ -252,17 +312,28 @@ async function handleRespond(request, env, ctx) {
         return corsJson({ error: 'schema_validation_failed', action: 'return_for_revision', errors: validation.errors }, { status: 422 });
     }
 
-    if (!topic || typeof topic !== 'string') {
-        return corsJson({ error: 'schema_validation_failed', errors: [{ field: 'topic', error: 'Required' }] }, { status: 422 });
+    // Tier 1: Response target matrix — check if this response type can target the given entry
+    if (payload?.target_id) {
+        const targetEntry = await getEntryFromKV(env, payload.target_id);
+        if (targetEntry) {
+            const matrixCheck = validateResponseTarget(type, targetEntry);
+            if (!matrixCheck.valid) {
+                return corsJson({
+                    error: 'invalid_response_target',
+                    message: matrixCheck.error,
+                }, { status: 422 });
+            }
+        }
+        // If target not found in KV (eventual consistency), allow — DO is source of truth
     }
 
     const entry = {
         type: 'response',
         subtype: type,
-        topic: topic.trim().toLowerCase(),
+        topic: normalizedTopic,
         author: {
             type: authorType,
-            device_attestation_hash: await hashString(deviceId),
+            topic_pseudonym: topicPseudonym,
             method: identity?.method || 'none',
             trust_level: identity?.trust_level || 'none',
             agent_operator: body.agent_operator || null,
@@ -274,10 +345,25 @@ async function handleRespond(request, env, ctx) {
 
     // Tier 2: classify (before budget — don't charge for held content)
     const classification = await classifyContent(env, entry);
-    if (classification.action === 'hard_reject_flag') {
-        if (ctx?.waitUntil) ctx.waitUntil(queueForHumanReview(env, entry, classification));
-        return corsJson({ status: 'held_for_review' }, { status: 202 });
+
+    if (classification.action === 'tier_1b_reject') {
+        if (ctx?.waitUntil) ctx.waitUntil(logSilentDrop(env, classification));
+        return corsJson({ error: 'submission_rejected' }, { status: 403 });
     }
+
+    if (classification.action === 'tier_1a_reject') {
+        const receiptWork = async () => {
+            await createRejectionReceipt(env, entry, classification);
+            await queueForHumanReview(env, entry, classification);
+        };
+        if (ctx?.waitUntil) ctx.waitUntil(receiptWork());
+        return corsJson({
+            status: 'rejected',
+            content_hash: classification.content_hash,
+            appeal_state: 'open',
+        }, { status: 422 });
+    }
+
     if (classification.tags?.length > 0) entry.moderation_tags = classification.tags;
 
     // Tier 1: Budget (after moderation — only charge for accepted content)
@@ -287,7 +373,7 @@ async function handleRespond(request, env, ctx) {
         return corsJson({ error: 'budget_exceeded', tokens_remaining: budgetResult.tokens_remaining, resets_at: budgetResult.resets_at }, { status: 429 });
     }
 
-    const chainResult = await appendToChain(env, entry.topic, entry);
+    const chainResult = await appendToChain(env, normalizedTopic, entry);
 
     const asyncWork = async () => {
         await replicateToKV(env, null, entry, chainResult);
@@ -299,6 +385,7 @@ async function handleRespond(request, env, ctx) {
         status: 'accepted',
         entry_id: chainResult.entry_id,
         entry_hash: chainResult.entry_hash,
+        payload_hash: chainResult.payload_hash,
         sequence: chainResult.sequence,
         moderation_tags: entry.moderation_tags || [],
         tokens_remaining: budgetResult.tokens_remaining,
@@ -307,27 +394,21 @@ async function handleRespond(request, env, ctx) {
 
 // ── Read Handlers ───────────────────────────────────────────────────
 
-/**
- * Get a single entry by ID via KV, with its responses.
- */
 async function handleGetEntry(env, entryId) {
     const meta = await getEntryFromKV(env, entryId);
     if (!meta) return corsJson({ error: 'not_found' }, { status: 404 });
 
-    // If we know the topic, fetch linked responses from the DO
     if (meta.topic) {
         const chainDO = getChainDO(env, meta.topic);
-        const resp = await chainDO.fetch(new Request('http://internal/entries?offset=0&limit=50&order=asc'));
+        const resp = await chainDO.fetch(new Request('http://internal/entries?offset=0&limit=200&order=asc'));
         const data = await resp.json();
         const allEntries = data.entries || [];
 
-        // Find responses linked to this entry
         const responses = allEntries.filter(e =>
             e.type === 'response' && (e.linked_to || []).includes(entryId)
         );
 
-        // Compute state
-        const computed = computeState(meta, responses);
+        const computed = computeState(meta, responses, { challenge_decay_hours: CHALLENGE_DECAY_HOURS });
 
         return corsJson({
             ...meta,
@@ -340,23 +421,18 @@ async function handleGetEntry(env, entryId) {
     return corsJson(meta);
 }
 
-/**
- * Get topic feed with computed states for all contributions.
- */
 async function getTopicFeedWithState(env, topic) {
-    // Fetch ALL entries from the DO (for state computation)
     const chainDO = getChainDO(env, topic);
     const resp = await chainDO.fetch(new Request('http://internal/entries?offset=0&limit=200&order=asc'));
     const data = await resp.json();
     const allEntries = data.entries || [];
 
-    // Compute state for each contribution
     const contributions = allEntries.filter(e => e.type === 'contribution');
     const responses = allEntries.filter(e => e.type === 'response');
 
     for (const c of contributions) {
         const linked = responses.filter(r => (r.linked_to || []).includes(c.entry_id));
-        const computed = computeState(c, linked);
+        const computed = computeState(c, linked, { challenge_decay_hours: CHALLENGE_DECAY_HOURS });
         c.computed_state = computed.state;
         c.display_hint = computed.display_hint;
         c.response_count = linked.length;
@@ -369,9 +445,6 @@ async function getTopicFeedWithState(env, topic) {
     };
 }
 
-/**
- * Render the topic page HTML with state-computed entries.
- */
 async function renderTopicPage(env, topic) {
     const feedData = await getTopicFeedWithState(env, topic.trim().toLowerCase());
     return renderHTML('topic', {
@@ -381,33 +454,92 @@ async function renderTopicPage(env, topic) {
 }
 
 /**
- * Get moderation log entries from KV.
+ * Get chain heads for all topics (for external anchoring / witnesses).
  */
+async function getChainHeads(env) {
+    const topics = await listTopics(env);
+    const heads = [];
+
+    for (const t of topics) {
+        try {
+            const chainDO = getChainDO(env, t.topic);
+            const resp = await chainDO.fetch(new Request('http://internal/chain-head'));
+            const head = await resp.json();
+            heads.push({
+                topic: t.topic,
+                ...head,
+            });
+        } catch (err) {
+            heads.push({ topic: t.topic, error: err.message });
+        }
+    }
+
+    return {
+        timestamp: new Date().toISOString(),
+        chain_heads: heads,
+    };
+}
+
+/**
+ * Export all entries for a topic (for independent verification).
+ */
+async function handleExport(env, topic) {
+    const chainDO = getChainDO(env, topic);
+    const resp = await chainDO.fetch(new Request('http://internal/entries?offset=0&limit=200&order=asc'));
+    const data = await resp.json();
+
+    // Also get chain head
+    const headResp = await chainDO.fetch(new Request('http://internal/chain-head'));
+    const head = await headResp.json();
+
+    return corsJson({
+        topic,
+        exported_at: new Date().toISOString(),
+        chain_head: head,
+        entries: data.entries || [],
+        total: data.total || 0,
+        note: 'This export can be independently verified by recomputing all entry hashes. Payload hashes are computed via JCS-SHA256 (RFC 8785 canonicalization).',
+    });
+}
+
 async function getModerationEntries(env) {
     const kv = env.ACTA_KV;
-    if (!kv) return { entries: [] };
+    if (!kv) return { entries: [], tier1b_silent_drop_count: 0 };
 
-    // List review items from KV (prefix scan)
-    const list = await kv.list({ prefix: 'review:' });
-    const entries = [];
+    // Get public Tier 1B counter
+    const tier1bCount = parseInt(await kv.get('moderation:tier1b_count') || '0');
 
-    for (const key of list.keys) {
+    // List Tier 1A rejection receipts
+    const receiptList = await kv.list({ prefix: 'receipt:' });
+    const receipts = [];
+    for (const key of receiptList.keys) {
+        const item = await kv.get(key.name, { type: 'json' });
+        if (item) receipts.push({ id: key.name, ...item });
+    }
+
+    // List Tier 3 review items
+    const reviewList = await kv.list({ prefix: 'review:' });
+    const reviews = [];
+    for (const key of reviewList.keys) {
         if (key.name === 'review:pending_count') continue;
         const item = await kv.get(key.name, { type: 'json' });
         if (item) {
-            entries.push({
+            reviews.push({
                 id: key.name,
                 action: item.classification?.action || 'unknown',
                 category: item.classification?.category || null,
                 reasoning: item.classification?.reasoning || null,
                 status: item.status,
                 queued_at: item.queued_at,
-                timestamp: item.queued_at,
             });
         }
     }
 
-    return { entries: entries.sort((a, b) => new Date(b.queued_at) - new Date(a.queued_at)) };
+    return {
+        tier1b_silent_drop_count: tier1bCount,
+        rejection_receipts: receipts.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)),
+        human_review_queue: reviews.sort((a, b) => new Date(b.queued_at) - new Date(a.queued_at)),
+    };
 }
 
 async function renderModerationLog(env) {
@@ -441,9 +573,4 @@ async function appendToChain(env, topic, entry) {
         body: JSON.stringify(entry),
     }));
     return resp.json();
-}
-
-async function hashString(str) {
-    const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-    return [...new Uint8Array(buffer)].map(b => b.toString(16).padStart(2, '0')).join('');
 }

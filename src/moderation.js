@@ -7,27 +7,34 @@
  *   ✗ LLMs may NOT declare claims true/false
  *   ✗ LLMs may NOT override state transitions
  *
- * Hard-reject flags escalate to Tier 3 (human review).
- * Everything else enters the ledger with tags.
+ * Hard-reject bifurcation (from adversarial analysis):
+ *   Tier 1A (doxxing, impersonation): Public rejection receipt with content hash.
+ *       Challengeable. Receipt contains: content_hash, category, timestamp, appeal_state.
+ *       No content stored, just the hash.
+ *   Tier 1B (CSAM, malware, credible violence): Silent drop. Internal-only log.
+ *       No public receipt, no hash, no appeal. Legally necessary carve-out.
+ *       Public counter incremented so the count of silent drops is visible.
  */
 
-// ── Hard-Reject Categories ──────────────────────────────────────────
+import { jcsSerialize } from './durable-objects/ledger-chain.js';
 
-const HARD_REJECT_CATEGORIES = [
-    'csam',
-    'malware',
-    'doxxing',
-    'impersonation',
-    'credible_violent_threat',
-];
+// ── Hard-Reject Categories (Bifurcated) ────────────────────────────
+
+// Tier 1B: Silent drop — no public receipt (legally mandated)
+const TIER_1B_SILENT = ['csam', 'malware', 'credible_violent_threat'];
+
+// Tier 1A: Public receipt — challengeable
+const TIER_1A_RECEIPT = ['doxxing', 'impersonation'];
+
+const ALL_HARD_REJECT = [...TIER_1B_SILENT, ...TIER_1A_RECEIPT];
 
 // ── Classification Tags ─────────────────────────────────────────────
 
 const CONTENT_TAGS = [
-    'likely_opinion',        // Content that reads as opinion but isn't labelled as such
-    'unsubstantiated',       // Factual-sounding claim without evidence
-    'potentially_misleading', // Contains common misinformation patterns
-    'review_pending',        // LLM uncertain — escalate to Tier 3
+    'likely_opinion',
+    'unsubstantiated',
+    'potentially_misleading',
+    'review_pending',
 ];
 
 // ── Main Classification Function ────────────────────────────────────
@@ -37,14 +44,11 @@ const CONTENT_TAGS = [
  *
  * Returns:
  *   { action: 'accept', tags: [...] }                    — enters ledger with tags
- *   { action: 'hard_reject_flag', category: '...' }      — escalated to Tier 3
+ *   { action: 'tier_1a_reject', category, content_hash } — public receipt, challengeable
+ *   { action: 'tier_1b_reject', category }               — silent drop, no receipt
  *   { action: 'accept', tags: [] }                       — clean, no tags
- *
- * This function NEVER makes a final hard-reject decision.
- * It only FLAGS for Tier 3 human review.
  */
 export async function classifyContent(env, entry) {
-    // Skip classification if Workers AI is not bound
     if (!env.AI) {
         return { action: 'accept', tags: [], skipped: true, reason: 'ai_not_configured' };
     }
@@ -89,8 +93,7 @@ For each piece of content, respond with a JSON object:
 Content tag rules:
 - Add "likely_opinion" if the content expresses a subjective view but the contribution type is "claim" with category "factual"
 - Add "unsubstantiated" only if the contribution type is "claim", category is "factual", and no source or reasoning is provided
-  (Note: the schema validator already catches this — you are a backup check)
-- Add "potentially_misleading" only if the content contains well-known false claims (flat earth, election denial with no evidence, etc.)
+- Add "potentially_misleading" only if the content contains well-known false claims
   Do NOT tag things as misleading just because you disagree
 - Add "review_pending" if you are uncertain about any of the above classifications
 
@@ -113,24 +116,34 @@ ${content.slice(0, 2000)}
             { role: 'user', content: userPrompt },
         ],
         max_tokens: 300,
-        temperature: 0.1, // Low temperature for consistent classification
+        temperature: 0.1,
     });
 
-    // Parse the LLM response
     const parsed = parseClassificationResponse(response.response || '');
 
     if (!parsed) {
         return { action: 'accept', tags: ['classification_parse_failed'] };
     }
 
-    // If safety flag → escalate to Tier 3 (NEVER auto-reject)
-    if (parsed.safety === 'flag_for_review' && HARD_REJECT_CATEGORIES.includes(parsed.safety_category)) {
+    // Check for hard-reject categories
+    if (parsed.safety === 'flag_for_review' && ALL_HARD_REJECT.includes(parsed.safety_category)) {
+        // Bifurcate: Tier 1B (silent) vs Tier 1A (receipt)
+        if (TIER_1B_SILENT.includes(parsed.safety_category)) {
+            return {
+                action: 'tier_1b_reject',
+                category: parsed.safety_category,
+                reasoning: parsed.safety_reasoning,
+                // No content hash, no public receipt. Internal log only.
+            };
+        }
+
+        // Tier 1A: public rejection receipt with content hash
+        const contentHash = await computeSha256(jcsSerialize(entry.payload || {}));
         return {
-            action: 'hard_reject_flag',
+            action: 'tier_1a_reject',
             category: parsed.safety_category,
             reasoning: parsed.safety_reasoning,
-            // This does NOT reject the content. It queues it for Tier 3 human review.
-            // The content is held (not written to ledger) pending human decision.
+            content_hash: contentHash,
         };
     }
 
@@ -150,36 +163,80 @@ ${content.slice(0, 2000)}
 function parseClassificationResponse(text) {
     if (!text) return null;
 
-    // Try direct parse
     try {
         return JSON.parse(text);
     } catch {
-        // Try extracting JSON from markdown code blocks
         const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
         if (jsonMatch) {
-            try {
-                return JSON.parse(jsonMatch[1]);
-            } catch {
-                // Fall through
-            }
+            try { return JSON.parse(jsonMatch[1]); } catch { /* fall through */ }
         }
 
-        // Try finding JSON object in text
         const objMatch = text.match(/\{[\s\S]*\}/);
         if (objMatch) {
-            try {
-                return JSON.parse(objMatch[0]);
-            } catch {
-                // Fall through
-            }
+            try { return JSON.parse(objMatch[0]); } catch { /* fall through */ }
         }
     }
 
     return null;
 }
 
+// ── Tier 1A: Public Rejection Receipts ──────────────────────────────
+
 /**
- * Tier 3 Queue — store items flagged for human review in KV.
+ * Create a public, challengeable rejection receipt in KV.
+ * Contains: content_hash, category, timestamp, appeal_state.
+ * Does NOT contain the content itself.
+ */
+export async function createRejectionReceipt(env, entry, classification) {
+    const kv = env.ACTA_KV;
+    if (!kv) return;
+
+    const receipt = {
+        type: 'rejection_receipt',
+        content_hash: classification.content_hash,
+        category: classification.category,
+        reasoning: classification.reasoning,
+        timestamp: new Date().toISOString(),
+        appeal_state: 'open', // Challengeable
+        topic: entry.topic,
+        entry_type: entry.type,
+        entry_subtype: entry.subtype,
+    };
+
+    const receiptId = `receipt:${crypto.randomUUID()}`;
+    await kv.put(receiptId, JSON.stringify(receipt), { expirationTtl: 86400 * 365 });
+
+    return receiptId;
+}
+
+// ── Tier 1B: Silent Drop (Internal Log Only) ────────────────────────
+
+/**
+ * Log a Tier 1B silent drop internally and increment public counter.
+ * The public sees HOW MANY were dropped but not WHAT was dropped.
+ */
+export async function logSilentDrop(env, classification) {
+    const kv = env.ACTA_KV;
+    if (!kv) return;
+
+    // Internal log (not public, for NCMEC/LE reporting)
+    const logKey = `internal:tier1b:${crypto.randomUUID()}`;
+    await kv.put(logKey, JSON.stringify({
+        category: classification.category,
+        reasoning: classification.reasoning,
+        timestamp: new Date().toISOString(),
+    }), { expirationTtl: 86400 * 90 }); // 90 day retention
+
+    // Public counter — visible at /api/moderation-log
+    const count = parseInt(await kv.get('moderation:tier1b_count') || '0');
+    await kv.put('moderation:tier1b_count', String(count + 1));
+}
+
+// ── Tier 3: Human Review Queue ──────────────────────────────────────
+
+/**
+ * Queue items for human review in KV.
+ * Used for Tier 1A items that need human decision.
  */
 export async function queueForHumanReview(env, entry, classification) {
     const kv = env.ACTA_KV;
@@ -195,9 +252,20 @@ export async function queueForHumanReview(env, entry, classification) {
     };
 
     const queueKey = `review:${crypto.randomUUID()}`;
-    await kv.put(queueKey, JSON.stringify(reviewItem), { expirationTtl: 86400 * 30 }); // 30 day TTL
+    await kv.put(queueKey, JSON.stringify(reviewItem), { expirationTtl: 86400 * 30 });
 
-    // Update pending count
     const pendingCount = parseInt(await kv.get('review:pending_count') || '0');
     await kv.put('review:pending_count', String(pendingCount + 1));
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+async function computeSha256(str) {
+    const buffer = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(str)
+    );
+    return [...new Uint8Array(buffer)]
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
 }

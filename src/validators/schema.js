@@ -16,16 +16,74 @@ const UPDATE_TYPES = ['correction', 'additional_context', 'scope_change', 'alter
 const RESOLUTION_TYPES = ['answered', 'confirmed', 'refuted', 'partially_confirmed', 'unresolvable'];
 
 // ── Token costs per action ──────────────────────────────────────────
+// Challenge cost is 1 (same as other responses).
+// The schema friction on challenges (target_assertion, basis, argument ≥ 20 chars)
+// is doing the real DDoS filtering, not economic cost.
 
 export const TOKEN_COSTS = {
     question: 2,
     claim: 2,
     prediction: 2,
     evidence: 1,
-    challenge: 2,  // Asymmetric friction — challenges cost more than standard responses
+    challenge: 1,
     update: 1,
     resolution: 1,
 };
+
+// ── Response Target Matrix ──────────────────────────────────────────
+// Explicit rules for what response types can target which contribution types.
+// - evidence: can target any contribution
+// - challenge: can target any contribution OR a resolution response
+// - update: can target any contribution (same-author enforcement is at the API layer)
+// - resolution: can target question or prediction ONLY (claims never resolve)
+
+export const RESPONSE_TARGET_MATRIX = {
+    evidence: { contribution: ['question', 'claim', 'prediction'], response: [] },
+    challenge: { contribution: ['question', 'claim', 'prediction'], response: ['resolution'] },
+    update: { contribution: ['question', 'claim', 'prediction'], response: [] },
+    resolution: { contribution: ['question', 'prediction'], response: [] },
+    // NOTE: 'claim' is deliberately excluded from resolution targets.
+    // The protocol shows argument structure; it never declares a claim true or false.
+};
+
+/**
+ * Validate that a response type can target the given entry.
+ * Called in the Worker after loading the target entry from the ledger.
+ *
+ * @param {string} responseType - evidence | challenge | update | resolution
+ * @param {object} targetEntry - the entry being responded to
+ * @returns {{ valid: boolean, error?: string }}
+ */
+export function validateResponseTarget(responseType, targetEntry) {
+    const matrix = RESPONSE_TARGET_MATRIX[responseType];
+    if (!matrix) return { valid: false, error: `Unknown response type: ${responseType}` };
+
+    if (targetEntry.type === 'contribution') {
+        if (!matrix.contribution.includes(targetEntry.subtype)) {
+            return {
+                valid: false,
+                error: `${responseType} cannot target a ${targetEntry.subtype}. ` +
+                    (responseType === 'resolution'
+                        ? 'Claims never resolve — the protocol shows argument structure, not verdicts.'
+                        : `Allowed targets: ${matrix.contribution.join(', ')}`),
+            };
+        }
+        return { valid: true };
+    }
+
+    if (targetEntry.type === 'response') {
+        if (!matrix.response.includes(targetEntry.subtype)) {
+            return {
+                valid: false,
+                error: `${responseType} cannot target a ${targetEntry.subtype} response. ` +
+                    `Allowed response targets: ${matrix.response.length ? matrix.response.join(', ') : 'none'}`,
+            };
+        }
+        return { valid: true };
+    }
+
+    return { valid: false, error: `Unknown target type: ${targetEntry.type}` };
+}
 
 // ── Contribution Validators ─────────────────────────────────────────
 
@@ -113,6 +171,22 @@ function validatePrediction(payload) {
         errors.push({ field: 'resolution_source', error: 'Required. URL or reference to the authoritative source for resolution.' });
     }
 
+    // Oracle specs (from adversarial analysis)
+    if (!payload.resolution_rule || typeof payload.resolution_rule !== 'string') {
+        errors.push({ field: 'resolution_rule', error: 'Required. Who or what triggers resolution (e.g., "Any contributor with source evidence", "Automated check against resolution_source").' });
+    }
+
+    // Optional oracle fields
+    if (payload.resolution_source_fallback && typeof payload.resolution_source_fallback !== 'string') {
+        errors.push({ field: 'resolution_source_fallback', error: 'Must be a string (URL or reference) if provided.' });
+    }
+
+    if (payload.challenge_window_hours !== undefined) {
+        if (typeof payload.challenge_window_hours !== 'number' || payload.challenge_window_hours < 1) {
+            errors.push({ field: 'challenge_window_hours', error: 'Must be a positive number (hours) if provided.' });
+        }
+    }
+
     return errors;
 }
 
@@ -157,11 +231,78 @@ export function validateResponse(type, payload) {
     return errors.length ? { valid: false, errors } : { valid: true };
 }
 
+// ── Source Evidence Envelope ─────────────────────────────────────────
+// Accepts either a full envelope object or a plain URL string (backwards compat).
+
+/**
+ * Validate and normalize a source field into a source evidence envelope.
+ * @param {string|object} source - Either a URL string or a full envelope
+ * @returns {{ valid: boolean, envelope?: object, errors?: Array }}
+ */
+export function validateSourceEnvelope(source) {
+    if (!source) {
+        return { valid: false, errors: [{ field: 'source', error: 'Required. Verifiable reference (URL, DOI, public record).' }] };
+    }
+
+    // Plain string (backwards compatible) — treat as source_url only
+    if (typeof source === 'string') {
+        return {
+            valid: true,
+            envelope: {
+                source_url: source,
+                retrieved_at: null,
+                content_hash: null,
+                excerpt: null,
+                excerpt_hash: null,
+                archive_url: null,
+            },
+        };
+    }
+
+    // Full envelope object
+    if (typeof source === 'object') {
+        const errors = [];
+
+        if (!source.source_url || typeof source.source_url !== 'string') {
+            errors.push({ field: 'source.source_url', error: 'Required. URL or DOI.' });
+        }
+
+        if (source.retrieved_at) {
+            const parsed = Date.parse(source.retrieved_at);
+            if (isNaN(parsed)) {
+                errors.push({ field: 'source.retrieved_at', error: 'Must be a valid ISO-8601 timestamp.' });
+            }
+        }
+
+        if (source.content_hash && typeof source.content_hash !== 'string') {
+            errors.push({ field: 'source.content_hash', error: 'Must be a string (SHA-256 hex).' });
+        }
+
+        if (errors.length) return { valid: false, errors };
+
+        return {
+            valid: true,
+            envelope: {
+                source_url: source.source_url,
+                retrieved_at: source.retrieved_at || null,
+                content_hash: source.content_hash || null,
+                excerpt: source.excerpt || null,
+                excerpt_hash: source.excerpt_hash || null,
+                archive_url: source.archive_url || null,
+            },
+        };
+    }
+
+    return { valid: false, errors: [{ field: 'source', error: 'Must be a URL string or a source evidence envelope object.' }] };
+}
+
 function validateEvidence(payload) {
     const errors = [];
 
-    if (!payload.source || typeof payload.source !== 'string') {
-        errors.push({ field: 'source', error: 'Required. Verifiable reference (URL, DOI, public record).' });
+    // Source (accepts string or envelope)
+    const sourceResult = validateSourceEnvelope(payload.source);
+    if (!sourceResult.valid) {
+        errors.push(...sourceResult.errors);
     }
 
     if (!EVIDENCE_STANCES.includes(payload.stance)) {
@@ -173,8 +314,8 @@ function validateEvidence(payload) {
 
 /**
  * Challenge validation — ASYMMETRIC FRICTION.
- * Challenges have stricter requirements than other responses to prevent
- * semantic DDoS (Brandolini's Law countermeasure).
+ * Challenges have stricter SCHEMA requirements than other responses to prevent
+ * semantic DDoS (Brandolini's Law countermeasure). Token cost is the same (1).
  */
 function validateChallenge(payload) {
     const errors = [];
@@ -200,12 +341,12 @@ function validateChallenge(payload) {
         });
     }
 
-    // Source required for certain basis types
-    if (['counter_evidence', 'source_unreliable'].includes(payload.basis) && !payload.source) {
-        errors.push({
-            field: 'source',
-            error: `Source required when basis is ${payload.basis}.`,
-        });
+    // Source required for certain basis types (accepts string or envelope)
+    if (['counter_evidence', 'source_unreliable'].includes(payload.basis)) {
+        const sourceResult = validateSourceEnvelope(payload.source);
+        if (!sourceResult.valid) {
+            errors.push({ field: 'source', error: `Source required when basis is ${payload.basis}.` });
+        }
     }
 
     return errors;
@@ -228,8 +369,10 @@ function validateResolution(payload) {
         errors.push({ field: 'outcome', error: 'Required. The resolution outcome.' });
     }
 
-    if (!payload.source || typeof payload.source !== 'string') {
-        errors.push({ field: 'source', error: 'Required. Evidence of resolution.' });
+    // Source (accepts string or envelope)
+    const sourceResult = validateSourceEnvelope(payload.source);
+    if (!sourceResult.valid) {
+        errors.push(...sourceResult.errors);
     }
 
     if (!RESOLUTION_TYPES.includes(payload.resolution_type)) {
@@ -241,19 +384,27 @@ function validateResolution(payload) {
 
 // ── State Machine ───────────────────────────────────────────────────
 
+// Default shot clock: 168 hours (7 days). Configurable per-topic in Policy.
+const DEFAULT_CHALLENGE_DECAY_HOURS = 168;
+
 /**
  * Compute the current state of a contribution based on its responses.
  * "supported" is a DISPLAY HINT, not an official state transition.
  * The protocol shows evidence structure — it never declares truth.
+ *
+ * @param {object} contribution - the contribution entry
+ * @param {Array} responses - response entries linked to this contribution
+ * @param {object} options - { challenge_decay_hours: number }
  */
-export function computeState(contribution, responses) {
+export function computeState(contribution, responses, options = {}) {
     const type = contribution.subtype;
+    const decayHours = options.challenge_decay_hours || DEFAULT_CHALLENGE_DECAY_HOURS;
 
     switch (type) {
         case 'question':
             return computeQuestionState(contribution, responses);
         case 'claim':
-            return computeClaimState(contribution, responses);
+            return computeClaimState(contribution, responses, decayHours);
         case 'prediction':
             return computePredictionState(contribution, responses);
         default:
@@ -282,7 +433,9 @@ function computeQuestionState(question, responses) {
     return { state: 'open', display_hint: null };
 }
 
-function computeClaimState(claim, responses) {
+function computeClaimState(claim, responses, decayHours) {
+    // Claims NEVER resolve. They can be: open, contested, superseded, tombstoned.
+
     // Check for supersession
     const superseded = responses.some(
         r => r.subtype === 'update' && r.payload?.update_type === 'scope_change'
@@ -296,18 +449,47 @@ function computeClaimState(claim, responses) {
         r => r.subtype === 'challenge' && r.target_id === claim.entry_id
     );
 
-    // Check which challenges have been addressed
-    const unaddressedChallenges = challenges.filter(challenge => {
-        const counterResponses = responses.filter(
+    // Check which challenges are active (not stale via shot clock)
+    const now = Date.now();
+    const activeChallenges = challenges.filter(challenge => {
+        // Find refuting evidence responses to this challenge
+        const refutingResponses = responses.filter(
             r => r.target_id === challenge.entry_id &&
                 (r.subtype === 'evidence' || r.subtype === 'update')
         );
-        // A challenge is addressed if it has at least one counter-response
-        // that itself hasn't been successfully challenged
-        return counterResponses.length === 0;
+
+        if (refutingResponses.length === 0) {
+            // No response to this challenge — it's active (unaddressed)
+            return true;
+        }
+
+        // There IS a response. Check the shot clock:
+        // If the earliest response is older than decayHours and no counter from
+        // the challenger, the challenge is stale.
+        const earliestResponse = refutingResponses.reduce((min, r) => {
+            const ts = new Date(r.timestamp).getTime();
+            return ts < min ? ts : min;
+        }, Infinity);
+
+        const hoursSinceResponse = (now - earliestResponse) / (1000 * 60 * 60);
+
+        // Has the challenger countered since the response?
+        const challengerCountered = responses.some(
+            r => r.subtype === 'challenge' &&
+                r.target_id !== claim.entry_id && // Not this original challenge
+                new Date(r.timestamp).getTime() > earliestResponse
+        );
+
+        if (hoursSinceResponse > decayHours && !challengerCountered) {
+            // Shot clock expired — challenge is stale, claim heals
+            return false;
+        }
+
+        // Challenge is still active (within shot clock or challenger countered)
+        return true;
     });
 
-    if (unaddressedChallenges.length > 0) {
+    if (activeChallenges.length > 0) {
         return { state: 'contested', display_hint: null };
     }
 

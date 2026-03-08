@@ -1,11 +1,20 @@
 /**
- * Tests for Acta schema validators and state machine.
+ * Tests for Acta schema validators, state machine, token costs,
+ * response target matrix, oracle specs, and source evidence envelope.
  *
  * Run: npx vitest
  */
 
 import { describe, it, expect } from 'vitest';
-import { validateContribution, validateResponse, computeState, TOKEN_COSTS } from '../src/validators/schema.js';
+import {
+    validateContribution,
+    validateResponse,
+    validateResponseTarget,
+    validateSourceEnvelope,
+    computeState,
+    TOKEN_COSTS,
+    RESPONSE_TARGET_MATRIX,
+} from '../src/validators/schema.js';
 
 // ── Contribution Validation ─────────────────────────────────────────
 
@@ -87,16 +96,43 @@ describe('validateContribution', () => {
         expect(result.errors.some(e => e.field === 'body')).toBe(true);
     });
 
-    // Predictions
-    it('accepts a valid prediction', () => {
+    // Predictions with Oracle Specs
+    it('accepts a valid prediction with oracle specs', () => {
         const futureDate = new Date(Date.now() + 86400000 * 30).toISOString();
         const result = validateContribution('prediction', {
             body: 'GPT-5 will be released by end of 2026.',
             resolution_criteria: 'OpenAI announces public availability of GPT-5.',
             resolution_date: futureDate,
             resolution_source: 'https://openai.com/blog',
+            resolution_rule: 'Any contributor may resolve with link to official announcement.',
         });
         expect(result.valid).toBe(true);
+    });
+
+    it('accepts prediction with optional oracle fields', () => {
+        const futureDate = new Date(Date.now() + 86400000 * 30).toISOString();
+        const result = validateContribution('prediction', {
+            body: 'Prediction with full oracle spec.',
+            resolution_criteria: 'Checked against source.',
+            resolution_date: futureDate,
+            resolution_source: 'https://primary.example.com',
+            resolution_rule: 'Automated check against primary source.',
+            resolution_source_fallback: 'https://fallback.example.com',
+            challenge_window_hours: 48,
+        });
+        expect(result.valid).toBe(true);
+    });
+
+    it('rejects a prediction without resolution_rule', () => {
+        const futureDate = new Date(Date.now() + 86400000 * 30).toISOString();
+        const result = validateContribution('prediction', {
+            body: 'Missing oracle spec.',
+            resolution_criteria: 'Something happens.',
+            resolution_date: futureDate,
+            resolution_source: 'https://example.com',
+        });
+        expect(result.valid).toBe(false);
+        expect(result.errors.some(e => e.field === 'resolution_rule')).toBe(true);
     });
 
     it('rejects a prediction without resolution criteria', () => {
@@ -104,6 +140,7 @@ describe('validateContribution', () => {
             body: 'Something will happen.',
             resolution_date: new Date(Date.now() + 86400000).toISOString(),
             resolution_source: 'https://example.com',
+            resolution_rule: 'Anyone with evidence.',
         });
         expect(result.valid).toBe(false);
         expect(result.errors.some(e => e.field === 'resolution_criteria')).toBe(true);
@@ -115,6 +152,7 @@ describe('validateContribution', () => {
             resolution_criteria: 'It happened.',
             resolution_date: '2020-01-01T00:00:00Z',
             resolution_source: 'https://example.com',
+            resolution_rule: 'Anyone.',
         });
         expect(result.valid).toBe(false);
         expect(result.errors.some(e => e.field === 'resolution_date')).toBe(true);
@@ -129,12 +167,28 @@ describe('validateContribution', () => {
 // ── Response Validation ─────────────────────────────────────────────
 
 describe('validateResponse', () => {
-    // Evidence
-    it('accepts valid evidence', () => {
+    // Evidence with source envelope
+    it('accepts evidence with string source (backwards compat)', () => {
         const result = validateResponse('evidence', {
             target_id: 'abc-123',
             body: 'Supporting evidence from NASA.',
             source: 'https://nasa.gov/data',
+            stance: 'supporting',
+        });
+        expect(result.valid).toBe(true);
+    });
+
+    it('accepts evidence with full source envelope', () => {
+        const result = validateResponse('evidence', {
+            target_id: 'abc-123',
+            body: 'Evidence with full envelope.',
+            source: {
+                source_url: 'https://nasa.gov/data',
+                retrieved_at: new Date().toISOString(),
+                content_hash: 'abcdef1234567890',
+                excerpt: 'The relevant section states...',
+                archive_url: 'https://web.archive.org/web/...',
+            },
             stance: 'supporting',
         });
         expect(result.valid).toBe(true);
@@ -150,7 +204,7 @@ describe('validateResponse', () => {
         expect(result.errors.some(e => e.field === 'source')).toBe(true);
     });
 
-    // Challenges — ASYMMETRIC FRICTION
+    // Challenges — ASYMMETRIC FRICTION (schema, not cost)
     it('accepts a well-formed challenge', () => {
         const result = validateResponse('challenge', {
             target_id: 'abc-123',
@@ -195,7 +249,6 @@ describe('validateResponse', () => {
             argument: 'Multiple studies show the opposite temperature trend over the last decade.',
         });
         expect(result.valid).toBe(false);
-        expect(result.errors.some(e => e.field === 'source')).toBe(true);
     });
 
     // Resolution
@@ -218,6 +271,80 @@ describe('validateResponse', () => {
             update_type: 'additional_context',
         });
         expect(result.valid).toBe(true);
+    });
+});
+
+// ── Source Evidence Envelope ─────────────────────────────────────────
+
+describe('validateSourceEnvelope', () => {
+    it('accepts a plain string source', () => {
+        const result = validateSourceEnvelope('https://example.com');
+        expect(result.valid).toBe(true);
+        expect(result.envelope.source_url).toBe('https://example.com');
+        expect(result.envelope.content_hash).toBeNull();
+    });
+
+    it('accepts a full envelope object', () => {
+        const result = validateSourceEnvelope({
+            source_url: 'https://example.com',
+            retrieved_at: '2026-01-01T00:00:00Z',
+            content_hash: 'abc123',
+            excerpt: 'Relevant section',
+            archive_url: 'https://archive.org/...',
+        });
+        expect(result.valid).toBe(true);
+        expect(result.envelope.source_url).toBe('https://example.com');
+        expect(result.envelope.content_hash).toBe('abc123');
+    });
+
+    it('rejects empty source', () => {
+        const result = validateSourceEnvelope(null);
+        expect(result.valid).toBe(false);
+    });
+
+    it('rejects envelope without source_url', () => {
+        const result = validateSourceEnvelope({ content_hash: 'abc' });
+        expect(result.valid).toBe(false);
+    });
+});
+
+// ── Response Target Matrix ──────────────────────────────────────────
+
+describe('validateResponseTarget', () => {
+    it('allows evidence targeting a claim', () => {
+        const result = validateResponseTarget('evidence', { type: 'contribution', subtype: 'claim' });
+        expect(result.valid).toBe(true);
+    });
+
+    it('allows challenge targeting a resolution response', () => {
+        const result = validateResponseTarget('challenge', { type: 'response', subtype: 'resolution' });
+        expect(result.valid).toBe(true);
+    });
+
+    it('rejects resolution targeting a claim (claims never resolve)', () => {
+        const result = validateResponseTarget('resolution', { type: 'contribution', subtype: 'claim' });
+        expect(result.valid).toBe(false);
+        expect(result.error).toContain('Claims never resolve');
+    });
+
+    it('allows resolution targeting a question', () => {
+        const result = validateResponseTarget('resolution', { type: 'contribution', subtype: 'question' });
+        expect(result.valid).toBe(true);
+    });
+
+    it('allows resolution targeting a prediction', () => {
+        const result = validateResponseTarget('resolution', { type: 'contribution', subtype: 'prediction' });
+        expect(result.valid).toBe(true);
+    });
+
+    it('rejects evidence targeting a resolution response', () => {
+        const result = validateResponseTarget('evidence', { type: 'response', subtype: 'resolution' });
+        expect(result.valid).toBe(false);
+    });
+
+    it('rejects challenge targeting an evidence response', () => {
+        const result = validateResponseTarget('challenge', { type: 'response', subtype: 'evidence' });
+        expect(result.valid).toBe(false);
     });
 });
 
@@ -249,13 +376,26 @@ describe('computeState', () => {
         expect(result.display_hint).toBe('supported');
     });
 
-    it('returns open when all challenges are addressed', () => {
+    it('returns contested when challenge is within shot clock', () => {
         const claim = { entry_id: 'c1', subtype: 'claim', state: 'open' };
         const responses = [
-            { entry_id: 'ch1', subtype: 'challenge', target_id: 'c1' },
-            { entry_id: 'e1', subtype: 'evidence', target_id: 'ch1', stance: 'refuting' },
+            { entry_id: 'ch1', subtype: 'challenge', target_id: 'c1', timestamp: new Date().toISOString() },
+            { entry_id: 'e1', subtype: 'evidence', target_id: 'ch1', timestamp: new Date().toISOString() },
         ];
-        const result = computeState(claim, responses);
+        // Within shot clock (default 168h) — still contested because response is fresh
+        const result = computeState(claim, responses, { challenge_decay_hours: 168 });
+        expect(result.state).toBe('contested');
+    });
+
+    it('returns open when shot clock expires (challenge decays to stale)', () => {
+        const claim = { entry_id: 'c1', subtype: 'claim', state: 'open' };
+        // Response is 8 days old (beyond 7-day default shot clock)
+        const oldDate = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+        const responses = [
+            { entry_id: 'ch1', subtype: 'challenge', target_id: 'c1', timestamp: oldDate },
+            { entry_id: 'e1', subtype: 'evidence', target_id: 'ch1', timestamp: oldDate },
+        ];
+        const result = computeState(claim, responses, { challenge_decay_hours: 168 });
         expect(result.state).toBe('open');
     });
 
@@ -297,13 +437,38 @@ describe('TOKEN_COSTS', () => {
         expect(TOKEN_COSTS.prediction).toBe(2);
     });
 
-    it('charges 1 token for standard responses', () => {
+    it('charges 1 token for all responses (including challenges)', () => {
         expect(TOKEN_COSTS.evidence).toBe(1);
         expect(TOKEN_COSTS.update).toBe(1);
         expect(TOKEN_COSTS.resolution).toBe(1);
+        expect(TOKEN_COSTS.challenge).toBe(1);
     });
 
-    it('charges 2 tokens for challenges (asymmetric friction)', () => {
-        expect(TOKEN_COSTS.challenge).toBe(2);
+    it('challenge cost is 1 (schema friction does the filtering, not cost)', () => {
+        // Explicitly test that challenge is NOT 2.
+        // The schema friction (target_assertion, basis, argument >= 20 chars)
+        // is the Brandolini countermeasure, not economic cost.
+        expect(TOKEN_COSTS.challenge).toBe(1);
+    });
+});
+
+// ── Response Target Matrix Structure ────────────────────────────────
+
+describe('RESPONSE_TARGET_MATRIX', () => {
+    it('excludes claim from resolution targets', () => {
+        expect(RESPONSE_TARGET_MATRIX.resolution.contribution).not.toContain('claim');
+    });
+
+    it('includes question and prediction in resolution targets', () => {
+        expect(RESPONSE_TARGET_MATRIX.resolution.contribution).toContain('question');
+        expect(RESPONSE_TARGET_MATRIX.resolution.contribution).toContain('prediction');
+    });
+
+    it('allows challenges to target resolutions', () => {
+        expect(RESPONSE_TARGET_MATRIX.challenge.response).toContain('resolution');
+    });
+
+    it('does not allow evidence to target responses', () => {
+        expect(RESPONSE_TARGET_MATRIX.evidence.response).toHaveLength(0);
     });
 });

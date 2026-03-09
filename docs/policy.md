@@ -35,9 +35,9 @@ Tokens are **fungible across activities**. A participant can spend 10 tokens on 
 
 | Parameter | v1 Value | Rationale |
 |---|---|---|
-| Challenge response cost | 2 tokens | Higher than a standard response (1 token). Asymmetric friction per Brandolini's Law |
+| Challenge response cost | 1 token | Same as other responses. Schema friction (must quote the assertion, select a formal basis, write a substantive argument ≥ 20 chars) is the Brandolini's Law countermeasure, not economic cost |
 
-This means a participant can post at most 5 challenges per day (spending their entire budget), while being able to post 10 responses per day. This ratio makes it structurally more expensive to contest than to contribute.
+This means challenges are as affordable as any other response. The asymmetric friction is structural (schema requirements), not economic.
 
 ---
 

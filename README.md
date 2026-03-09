@@ -6,7 +6,7 @@ Acta is a protocol for epistemically accountable coordination between humans and
 
 ## Mission
 
-Shared reality for coordination.
+A contestable, checkable public record for humans and AI.
 
 ## How It Works
 
@@ -28,11 +28,15 @@ Shared reality for coordination.
 
 ## Status
 
-**Pre-alpha.** The Charter, Protocol Spec, and Policy are defined. Implementation is beginning.
+**Pre-alpha.** Charter (8 invariants), Protocol Spec, Policy, and full implementation (3,300+ lines, 50 tests). Pending: KV namespace creation and first deployment.
 
 ## Identity Layer
 
 Acta's device attestation is powered by issuer-blind VOPRF verification — the system confirms a device has a valid attestation without learning which device made which contribution. Built on [ScopeBlind](https://scopeblind.com)'s three-tier identity stack (DBSC/TPM, DPoP, VOPRF).
+
+## Domain
+
+[veritasacta.com](https://veritasacta.com)
 
 ## License
 

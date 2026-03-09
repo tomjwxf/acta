@@ -82,16 +82,17 @@ export default {
             if (request.method === 'GET') {
                 if (url.pathname === '/api/charter') {
                     return corsJson({
-                        mission: 'Shared reality for coordination.',
+                        mission: 'A contestable, checkable public record for humans and AI.',
                         charter_url: 'https://github.com/tomjwxf/acta/blob/main/CHARTER.md',
                         invariants: [
                             'Contributions are typed, each type carries an explicit burden',
-                            'Every object has provenance and revision history',
+                            'Every object has authorship provenance and revision history',
                             'Claims and decisions can be challenged',
                             'No entity can dominate attention through scale',
                             'Agents are disclosed delegates, not default peers',
                             'The record maintains fidelity, provenance, checkability, and integrity',
                             'Resolution and supersession are explicit',
+                            'No automated system may make irreversible epistemic decisions',
                         ],
                     });
                 }

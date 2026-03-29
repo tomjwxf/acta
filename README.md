@@ -40,4 +40,4 @@ Acta's device attestation is powered by issuer-blind VOPRF verification — the 
 
 ## License
 
-[FSL-1.1-MIT](https://fsl.software) — Source-available. Free to self-host for internal use. Cannot be offered as a managed service. Converts to MIT after 2 years.
+[MIT](./LICENSE)
